@@ -1,6 +1,26 @@
 #include <metal_stdlib>
-#include "gaussian_splat_types.h"
 using namespace metal;
+
+// Multi-Layer Alpha Blending (MLAB) configuration
+// Based on Apple's OIT sample - uses color attachments with raster order groups
+// Metal supports max 8 color attachments
+//
+// Current implementation: 6 layers
+// - 6 attachments for layer RGBA (premultiplied color + visibility)
+// - 2 attachments for packed depths (3 depths per RGBA channel)
+#define NUM_OIT_LAYERS 6
+
+// K-Buffer: stores sorted layers of transparent fragments
+typedef struct {
+    half4 layer0 [[color(0)]];  // RGBA: premultiplied color + visibility
+    half4 layer1 [[color(1)]];
+    half4 layer2 [[color(2)]];
+    half4 layer3 [[color(3)]];
+    half4 layer4 [[color(4)]];
+    half4 layer5 [[color(5)]];
+    half4 depths01  [[color(6)]];  // RG: depths for layers 0-1, BA: depths for layers 2-3
+    half4 depths23  [[color(7)]];  // RG: depths for layers 4-5, BA: unused
+} KBuffer;
 
 struct SplatInstance {
     packed_float4 rotation;
@@ -176,17 +196,18 @@ vertex VertexOut vertex_main(
 }
 
 
-fragment void fragment_main(
+// Fragment shader - Multi-Layer Alpha Blending with K-Buffer
+// This reads AND writes the K-Buffer using raster order groups
+fragment KBuffer fragment_main(
     VertexOut in [[stage_in]],
-    imageblock_data<ImageBlockData> imageblock [[imageblock_data]]
+    KBuffer kbuffer  // Input: read current K-Buffer state
 ) {
     // Evaluate 2D Gaussian
-    // UV coordinates are in standard deviation units: [-3σ, 3σ] range
     float2 d = in.uv;
 
     // Cull splats behind camera
     if (in.depth < 0.001) {
-        discard_fragment();
+        return kbuffer;  // Return unchanged
     }
 
     // Canonical Gaussian in sigma space: exp(-0.5 * ||d||^2)
@@ -194,42 +215,148 @@ fragment void fragment_main(
 
     // Discard fragments that contribute very little
     if (gaussianValue < 0.01) {
-        discard_fragment();
+        return kbuffer;
     }
 
     // Apply per-splat opacity
     float alpha = gaussianValue * in.color.a;
+    half newDepth = half(in.depth);
 
-    // Write to imageblock instead of framebuffer
-    uint index = imageblock.count;
+    // Premultiplied color + visibility (under operator)
+    half4 newLayer = half4(half3(in.color.rgb) * half(alpha), 1.0h - half(alpha));
 
-    if (index >= MAX_FRAGMENTS_PER_PIXEL) {
-        // OVERFLOW HANDLING: Replace furthest fragment if current is closer
-        uint furthest_idx = 0;
-        half furthest_depth = imageblock.fragments[0].depth;
+    // Read K-Buffer into array for sorting
+    half4 layers[NUM_OIT_LAYERS];
+    half depths[NUM_OIT_LAYERS];
 
-        for (uint i = 1; i < MAX_FRAGMENTS_PER_PIXEL; i++) {
-            if (imageblock.fragments[i].depth < furthest_depth) {
-                furthest_depth = imageblock.fragments[i].depth;
-                furthest_idx = i;
-            }
-        }
+    layers[0] = kbuffer.layer0;
+    layers[1] = kbuffer.layer1;
+    layers[2] = kbuffer.layer2;
+    layers[3] = kbuffer.layer3;
+    layers[4] = kbuffer.layer4;
+    layers[5] = kbuffer.layer5;
 
-        // Only replace if current fragment is closer
-        if (half(in.depth) > furthest_depth) {
-            index = furthest_idx;
-        } else {
-            discard_fragment();  // Current fragment is further, discard
+    depths[0] = kbuffer.depths01.r;
+    depths[1] = kbuffer.depths01.g;
+    depths[2] = kbuffer.depths01.b;
+    depths[3] = kbuffer.depths01.a;
+    depths[4] = kbuffer.depths23.r;
+    depths[5] = kbuffer.depths23.g;
+
+    // Insertion sort: insert new fragment in depth order (front to back)
+    const short lastLayer = NUM_OIT_LAYERS - 1;
+    for (short i = 0; i < NUM_OIT_LAYERS; ++i) {
+        half layerDepth = depths[i];
+        bool insert = (newDepth >= layerDepth);  // Front-to-back (larger depth = closer)
+
+        if (insert) {
+            // Insert here, shift current layer down
+            half4 tempLayer = layers[i];
+            half tempDepth = depths[i];
+
+            layers[i] = newLayer;
+            depths[i] = newDepth;
+
+            newLayer = tempLayer;
+            newDepth = tempDepth;
         }
     }
 
-    // Write fragment data
-    imageblock.fragments[index].depth = half(in.depth);
-    imageblock.fragments[index].color = half3(in.color.rgb);
-    imageblock.fragments[index].alpha = half(alpha);
+    // Merge last two layers if buffer overflows
+    half4 lastLayerColor = layers[lastLayer];
+    half lastLayerDepth = depths[lastLayer];
 
-    if (index == imageblock.count) {
-        imageblock.count++;  // Increment only if new fragment
+    bool newDepthCloser = (newDepth >= lastLayerDepth);
+    half4 frontLayer = newDepthCloser ? newLayer : lastLayerColor;
+    half4 backLayer = newDepthCloser ? lastLayerColor : newLayer;
+
+    // Under operator: front UNDER back = back.rgb + front.rgb * back.a
+    layers[lastLayer] = half4(backLayer.rgb + frontLayer.rgb * backLayer.a,
+                              frontLayer.a * backLayer.a);
+    depths[lastLayer] = newDepthCloser ? newDepth : lastLayerDepth;
+
+    // Write K-Buffer back
+    KBuffer output;
+    output.layer0 = layers[0];
+    output.layer1 = layers[1];
+    output.layer2 = layers[2];
+    output.layer3 = layers[3];
+    output.layer4 = layers[4];
+    output.layer5 = layers[5];
+
+    output.depths01 = half4(depths[0], depths[1], depths[2], depths[3]);
+    output.depths23 = half4(depths[4], depths[5], 0.0h, 0.0h);
+
+    return output;
+}
+
+// Fullscreen triangle for resolve pass
+struct FullscreenVertexOut {
+    float4 position [[position]];
+};
+
+vertex FullscreenVertexOut fullscreentriangle_vertex(uint vid [[vertex_id]]) {
+    FullscreenVertexOut out;
+    switch(vid) {
+        case 0:
+            out.position = float4(-1, -3, 0, 1);
+            break;
+        case 1:
+            out.position = float4(-1, 1, 0, 1);
+            break;
+        case 2:
+            out.position = float4(3, 1, 0, 1);
+            break;
     }
+    return out;
+}
+
+// Resolve pass: composite K-Buffer layers into final image
+// Reads from K-Buffer attachments 1-6, writes to output attachment 0
+typedef struct {
+    half4 layer0 [[color(1)]];  // K-Buffer starts at attachment 1
+    half4 layer1 [[color(2)]];
+    half4 layer2 [[color(3)]];
+    half4 layer3 [[color(4)]];
+    half4 layer4 [[color(5)]];
+    half4 layer5 [[color(6)]];
+} KBufferNoDepth;
+
+struct ResolveOut {
+    half4 color [[color(0)]];  // Output to attachment 0 (drawable)
+};
+
+fragment ResolveOut resolve_main(KBufferNoDepth kbuffer) {
+    // Composite layers front-to-back using under operator
+    half3 finalColor = half3(0.0h);
+    half alphaTotal = 1.0h;
+
+    // Layer 0 (closest)
+    finalColor += kbuffer.layer0.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer0.a;
+
+    // Layer 1
+    finalColor += kbuffer.layer1.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer1.a;
+
+    // Layer 2
+    finalColor += kbuffer.layer2.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer2.a;
+
+    // Layer 3
+    finalColor += kbuffer.layer3.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer3.a;
+
+    // Layer 4
+    finalColor += kbuffer.layer4.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer4.a;
+
+    // Layer 5 (furthest)
+    finalColor += kbuffer.layer5.rgb * alphaTotal;
+    alphaTotal *= kbuffer.layer5.a;
+
+    ResolveOut out;
+    out.color = half4(finalColor, 1.0h - alphaTotal);
+    return out;
 }
 

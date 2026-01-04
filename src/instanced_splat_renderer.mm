@@ -10,11 +10,19 @@
 class InstancedSplatRenderer::Impl {
 public:
   id<MTLDevice> device;
-  id<MTLRenderPipelineState> pipelineState;
+  id<MTLRenderPipelineState> pipelineState;       // Splat rendering pipeline (MLAB or 50-layer)
+  id<MTLRenderPipelineState> resolvePipelineState; // K-Buffer resolve pipeline (MLAB)
+  id<MTLComputePipelineState> computeSortPipeline; // Compute sort pipeline (50-layer)
   id<MTLBuffer> instanceBuffer;
   id<MTLBuffer> uniformBuffer;
-  id<MTLTexture> depthTexture;
-  id<MTLDepthStencilState> depthStencilState;
+
+  // K-Buffer textures (8 total: 6 layers + 2 depth buffers) - for MLAB mode
+  id<MTLTexture> kbufferTextures[8];
+
+  // Per-pixel fragment list buffer - for 50-layer mode
+  id<MTLBuffer> fragmentListBuffer;
+  id<MTLTexture> outputTexture;
+
   size_t instanceCount = 0;
 
   // Hot reload support
@@ -22,9 +30,12 @@ public:
   NSTimeInterval lastModifiedTime = 0;
   bool shaderNeedsReload = false;
 
-  // Current viewport dimensions for depth texture
+  // Current viewport dimensions
   int currentWidth = 0;
   int currentHeight = 0;
+
+  // Rendering mode
+  bool use50LayerMode = true;  // Toggle between MLAB (6 layers) and compute (50 layers)
 
   bool initializePipeline() {
     NSError *error = nil;
@@ -32,12 +43,14 @@ public:
     // Load shader from file (store path for hot reload)
     if (!shaderPath) {
       // For development: watch the SOURCE file, not the build directory copy
-      // This way edits to the source file trigger hot-reload immediately
       NSString *executablePath = [[NSBundle mainBundle] executablePath];
       NSString *buildDir = [executablePath stringByDeletingLastPathComponent];
 
+      // Choose shader based on mode
+      NSString *shaderFilename = use50LayerMode ? @"gaussian_splat_50layer.metal" : @"gaussian_splat.metal";
+
       // Go up from build/gaussian_splat.app/Contents/MacOS to the source directory
-      shaderPath = [buildDir stringByAppendingPathComponent:@"../../../../shaders/gaussian_splat.metal"];
+      shaderPath = [buildDir stringByAppendingPathComponent:[NSString stringWithFormat:@"../../../../shaders/%@", shaderFilename]];
       shaderPath = [shaderPath stringByStandardizingPath];
 
       // Verify the source file exists
@@ -45,9 +58,11 @@ public:
         std::cerr << "⚠️  Source shader not found at: " << [shaderPath UTF8String] << std::endl;
 
         // Fallback to build directory copy
-        shaderPath = [[NSBundle mainBundle] pathForResource:@"gaussian_splat" ofType:@"metal" inDirectory:@"shaders"];
+        shaderPath = [[NSBundle mainBundle] pathForResource:[shaderFilename stringByDeletingPathExtension]
+                                                     ofType:@"metal"
+                                                inDirectory:@"shaders"];
         if (!shaderPath) {
-          shaderPath = [buildDir stringByAppendingPathComponent:@"../shaders/gaussian_splat.metal"];
+          shaderPath = [buildDir stringByAppendingPathComponent:[NSString stringWithFormat:@"../shaders/%@", shaderFilename]];
         }
       }
     }
@@ -95,38 +110,93 @@ public:
     }
 
     id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
-    id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_main"];
+    id<MTLFunction> fragmentFunc = nil;
+    id<MTLFunction> resolveFunc = nil;
+    id<MTLFunction> computeSortFunc = nil;
 
-    if (!vertexFunc || !fragmentFunc) {
-      std::cerr << "❌ Failed to find shader functions (vertex_main, fragment_main)" << std::endl;
+    if (use50LayerMode) {
+      fragmentFunc = [library newFunctionWithName:@"fragment_accumulate"];
+      computeSortFunc = [library newFunctionWithName:@"compute_sort_composite"];
+
+      if (!vertexFunc || !fragmentFunc || !computeSortFunc) {
+        std::cerr << "❌ Failed to find 50-layer shader functions" << std::endl;
+        return false;
+      }
+    } else {
+      fragmentFunc = [library newFunctionWithName:@"fragment_main"];
+      resolveFunc = [library newFunctionWithName:@"resolve_main"];
+
+      if (!vertexFunc || !fragmentFunc || !resolveFunc) {
+        std::cerr << "❌ Failed to find MLAB shader functions" << std::endl;
+        return false;
+      }
+    }
+
+    // Create rendering pipeline
+    MTLRenderPipelineDescriptor *splatDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    splatDesc.vertexFunction = vertexFunc;
+    splatDesc.fragmentFunction = fragmentFunc;
+
+    if (use50LayerMode) {
+      // 50-layer mode: fragment shader doesn't write to color attachments
+      // It only writes to the fragment list buffer
+      splatDesc.label = @"Gaussian Splat 50-Layer Accumulate Pipeline";
+      // No color attachments needed - fragment shader writes to buffer
+      splatDesc.colorAttachments[0].pixelFormat = MTLPixelFormatInvalid;
+      splatDesc.rasterizationEnabled = YES;  // Still need rasterization
+    } else {
+      // MLAB mode: Configure 8 color attachments for K-Buffer (6 layers + 2 depth)
+      splatDesc.label = @"Gaussian Splat K-Buffer Pipeline";
+      for (int i = 0; i < 8; i++) {
+        splatDesc.colorAttachments[i].pixelFormat = MTLPixelFormatRGBA16Float;
+        splatDesc.colorAttachments[i].blendingEnabled = NO;
+      }
+    }
+
+    pipelineState = [device newRenderPipelineStateWithDescriptor:splatDesc error:&error];
+
+    if (!pipelineState) {
+      std::cerr << "❌ Failed to create pipeline state!" << std::endl;
+      std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
       return false;
     }
 
-    // Create simple pipeline with alpha blending
-    MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    pipelineDesc.vertexFunction = vertexFunc;
-    pipelineDesc.fragmentFunction = fragmentFunc;
+    // Create secondary pipeline based on mode
+    if (use50LayerMode) {
+      // Create compute pipeline for sorting and compositing
+      computeSortPipeline = [device newComputePipelineStateWithFunction:computeSortFunc error:&error];
 
-    // Single color attachment
-    // pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    // pipelineDesc.colorAttachments[0].blendingEnabled = NO;  // Opaque rendering
+      if (!computeSortPipeline) {
+        std::cerr << "❌ Failed to create compute sort pipeline!" << std::endl;
+        std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
+        return false;
+      }
+    } else {
+      // Create resolve pipeline (composites K-Buffer to final image)
+      MTLRenderPipelineDescriptor *resolveDesc = [[MTLRenderPipelineDescriptor alloc] init];
+      resolveDesc.label = @"K-Buffer Resolve Pipeline";
+      resolveDesc.vertexFunction = [library newFunctionWithName:@"fullscreentriangle_vertex"];
+      resolveDesc.fragmentFunction = resolveFunc;
 
-    // Single color attachment with standard alpha blending
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+      // Output attachment (drawable)
+      resolveDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+      resolveDesc.colorAttachments[0].blendingEnabled = YES;
+      resolveDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+      resolveDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
-    pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+      // Input attachments (K-Buffer layers) - attachments 1-6
+      for (int i = 1; i <= 6; i++) {
+        resolveDesc.colorAttachments[i].pixelFormat = MTLPixelFormatRGBA16Float;
+        resolveDesc.colorAttachments[i].blendingEnabled = NO;
+      }
 
-    if (!pipelineState) {
-      std::cerr << "❌ Failed to create splat pipeline state!" << std::endl;
-      std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
-      return false;
+      resolvePipelineState = [device newRenderPipelineStateWithDescriptor:resolveDesc error:&error];
+
+      if (!resolvePipelineState) {
+        std::cerr << "❌ Failed to create resolve pipeline state!" << std::endl;
+        std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
+        return false;
+      }
     }
 
     std::cout << "✅ Shader pipeline compiled successfully\n" << std::endl;
@@ -151,25 +221,64 @@ public:
     return true;
   }
 
-  void ensureDepthTexture(int width, int height) {
-    if (depthTexture && currentWidth == width && currentHeight == height) {
-      return;  // Texture already exists with correct size
+  void ensureKBufferTextures(int width, int height) {
+    if (kbufferTextures[0] && currentWidth == width && currentHeight == height) {
+      return;  // Textures already exist with correct size
     }
 
     currentWidth = width;
     currentHeight = height;
 
-    // Create depth texture
-    MTLTextureDescriptor *depthDesc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+    // Create 8 K-Buffer textures (6 layers + 2 depth buffers)
+    MTLTextureDescriptor *kbufferDesc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                      width:width
                                     height:height
                                  mipmapped:NO];
-    depthDesc.usage = MTLTextureUsageRenderTarget;
-    depthDesc.storageMode = MTLStorageModePrivate;
+    kbufferDesc.usage = MTLTextureUsageRenderTarget;
+    kbufferDesc.storageMode = MTLStorageModePrivate;
 
-    depthTexture = [device newTextureWithDescriptor:depthDesc];
-    [depthTexture setLabel:@"Splat Depth Buffer"];
+    for (int i = 0; i < 8; i++) {
+      kbufferTextures[i] = [device newTextureWithDescriptor:kbufferDesc];
+      [kbufferTextures[i] setLabel:[NSString stringWithFormat:@"K-Buffer Attachment %d", i]];
+    }
+  }
+
+  void ensureFragmentListBuffer(int width, int height, MTLPixelFormat drawableFormat) {
+    if (fragmentListBuffer && currentWidth == width && currentHeight == height &&
+        outputTexture && outputTexture.pixelFormat == drawableFormat) {
+      return;  // Buffer already exists with correct size and format
+    }
+
+    currentWidth = width;
+    currentHeight = height;
+
+    // Create per-pixel fragment list buffer
+    // Structure: struct PixelFragmentList { atomic_uint count; FragmentNode fragments[50]; }
+    // FragmentNode: half3 color (6 bytes) + half visibility (2 bytes) + half depth (2 bytes) = 10 bytes
+    // PixelFragmentList: 4 bytes (count) + 50 * 10 bytes (fragments) = 504 bytes per pixel
+    size_t bytesPerPixel = 4 + (50 * 10);  // Slightly larger for alignment
+    size_t totalPixels = width * height;
+    size_t bufferSize = totalPixels * bytesPerPixel;
+
+    fragmentListBuffer = [device newBufferWithLength:bufferSize
+                                             options:MTLResourceStorageModePrivate];
+    [fragmentListBuffer setLabel:@"Per-Pixel Fragment Lists"];
+
+    // Create output texture for compute shader - match drawable format for blit compatibility
+    MTLTextureDescriptor *outputDesc = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:drawableFormat
+                                     width:width
+                                    height:height
+                                 mipmapped:NO];
+    outputDesc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    outputDesc.storageMode = MTLStorageModePrivate;
+
+    outputTexture = [device newTextureWithDescriptor:outputDesc];
+    [outputTexture setLabel:@"50-Layer Output Texture"];
+
+    std::cout << "📊 Created fragment list buffer: " << (bufferSize / 1024 / 1024) << " MB for "
+              << width << "x" << height << " pixels" << std::endl;
   }
 
 
@@ -333,8 +442,12 @@ void InstancedSplatRenderer::render(void *commandBuffer,
   id<MTLCommandBuffer> cmdBuffer = (__bridge id<MTLCommandBuffer>)commandBuffer;
   id<MTLTexture> drawable = (__bridge id<MTLTexture>)drawableTexture;
 
-  // Ensure depth texture matches viewport size
-  impl->ensureDepthTexture(viewportWidth, viewportHeight);
+  // Ensure appropriate resources based on mode
+  if (impl->use50LayerMode) {
+    impl->ensureFragmentListBuffer(viewportWidth, viewportHeight, drawable.pixelFormat);
+  } else {
+    impl->ensureKBufferTextures(viewportWidth, viewportHeight);
+  }
 
   // Calculate view-projection matrix
   simd_float4x4 viewProjectionMatrix = simd_mul(projectionMatrix, viewMatrix);
@@ -355,33 +468,111 @@ void InstancedSplatRenderer::render(void *commandBuffer,
 
   memcpy([impl->uniformBuffer contents], &uniforms, sizeof(UniformData));
 
-  // Render splats directly to drawable with depth testing
-  MTLRenderPassDescriptor *passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-  passDesc.colorAttachments[0].texture = drawable;
-  passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;  // Preserve existing content
-  passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+  if (impl->use50LayerMode) {
+    // ===== 50-LAYER MODE: 3-pass rendering =====
 
-  // Configure depth attachment for opaque rendering
-  passDesc.depthAttachment.texture = impl->depthTexture;
-  passDesc.depthAttachment.loadAction = MTLLoadActionClear;
-  passDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
-  passDesc.depthAttachment.clearDepth = 0.0;  // Clear to 0.0 for Greater comparison
+    // PASS 1: Clear fragment list buffer
+    id<MTLBlitCommandEncoder> blitEncoder = [cmdBuffer blitCommandEncoder];
+    [blitEncoder fillBuffer:impl->fragmentListBuffer range:NSMakeRange(0, impl->fragmentListBuffer.length) value:0];
+    [blitEncoder endEncoding];
 
-  id<MTLRenderCommandEncoder> encoder = [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
-  [encoder setLabel:@"Gaussian Splat Pass"];
-  [encoder setRenderPipelineState:impl->pipelineState];
-  // [encoder setDepthStencilState:impl->depthStencilState];
-  [encoder setCullMode:MTLCullModeNone];  // Render both sides of billboards
+    // PASS 2: Accumulate fragments (rasterization pass)
+    MTLRenderPassDescriptor *accumPass = [MTLRenderPassDescriptor renderPassDescriptor];
+    // No color attachments - fragment shader writes to buffer
+    accumPass.renderTargetWidth = viewportWidth;
+    accumPass.renderTargetHeight = viewportHeight;
+    accumPass.defaultRasterSampleCount = 1;  // Required when no color attachments
 
-  // Bind buffers
-  [encoder setVertexBuffer:impl->instanceBuffer offset:0 atIndex:0];
-  [encoder setVertexBuffer:impl->uniformBuffer offset:0 atIndex:1];
+    id<MTLRenderCommandEncoder> accumEncoder = [cmdBuffer renderCommandEncoderWithDescriptor:accumPass];
+    [accumEncoder setLabel:@"50-Layer Fragment Accumulation"];
+    [accumEncoder setRenderPipelineState:impl->pipelineState];
+    [accumEncoder setCullMode:MTLCullModeNone];
 
-  // Draw instanced quads
-  [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                vertexStart:0
-                vertexCount:6
-              instanceCount:impl->instanceCount];
+    [accumEncoder setVertexBuffer:impl->instanceBuffer offset:0 atIndex:0];
+    [accumEncoder setVertexBuffer:impl->uniformBuffer offset:0 atIndex:1];
+    [accumEncoder setFragmentBuffer:impl->fragmentListBuffer offset:0 atIndex:0];
+    [accumEncoder setFragmentBuffer:impl->uniformBuffer offset:0 atIndex:1];
 
-  [encoder endEncoding];
+    [accumEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:6
+                      instanceCount:impl->instanceCount];
+    [accumEncoder endEncoding];
+
+    // PASS 3: Sort and composite (compute shader)
+    id<MTLComputeCommandEncoder> computeEncoder = [cmdBuffer computeCommandEncoder];
+    [computeEncoder setLabel:@"50-Layer Sort & Composite"];
+    [computeEncoder setComputePipelineState:impl->computeSortPipeline];
+
+    [computeEncoder setBuffer:impl->fragmentListBuffer offset:0 atIndex:0];
+    [computeEncoder setBuffer:impl->uniformBuffer offset:0 atIndex:1];
+    [computeEncoder setTexture:impl->outputTexture atIndex:0];
+
+    MTLSize gridSize = MTLSizeMake(viewportWidth, viewportHeight, 1);
+    MTLSize threadgroupSize = MTLSizeMake(8, 8, 1);
+
+    [computeEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+    [computeEncoder endEncoding];
+
+    // PASS 4: Blit output texture to drawable
+    id<MTLBlitCommandEncoder> finalBlit = [cmdBuffer blitCommandEncoder];
+    [finalBlit copyFromTexture:impl->outputTexture
+                   sourceSlice:0
+                   sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(viewportWidth, viewportHeight, 1)
+                     toTexture:drawable
+              destinationSlice:0
+              destinationLevel:0
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [finalBlit endEncoding];
+
+  } else {
+    // ===== MLAB MODE: 2-pass rendering =====
+
+    // PASS 1: Render splats to K-Buffer
+    MTLRenderPassDescriptor *kbufferPass = [MTLRenderPassDescriptor renderPassDescriptor];
+
+    for (int i = 0; i < 8; i++) {
+      kbufferPass.colorAttachments[i].texture = impl->kbufferTextures[i];
+      kbufferPass.colorAttachments[i].loadAction = MTLLoadActionClear;
+      kbufferPass.colorAttachments[i].storeAction = MTLStoreActionStore;
+      kbufferPass.colorAttachments[i].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+    }
+
+    id<MTLRenderCommandEncoder> kbufferEncoder = [cmdBuffer renderCommandEncoderWithDescriptor:kbufferPass];
+    [kbufferEncoder setLabel:@"K-Buffer Splat Pass"];
+    [kbufferEncoder setRenderPipelineState:impl->pipelineState];
+    [kbufferEncoder setCullMode:MTLCullModeNone];
+
+    [kbufferEncoder setVertexBuffer:impl->instanceBuffer offset:0 atIndex:0];
+    [kbufferEncoder setVertexBuffer:impl->uniformBuffer offset:0 atIndex:1];
+
+    [kbufferEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:6
+                      instanceCount:impl->instanceCount];
+    [kbufferEncoder endEncoding];
+
+    // PASS 2: Resolve K-Buffer to final framebuffer
+    MTLRenderPassDescriptor *resolvePass = [MTLRenderPassDescriptor renderPassDescriptor];
+    resolvePass.colorAttachments[0].texture = drawable;
+    resolvePass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    resolvePass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    for (int i = 0; i < 6; i++) {
+      resolvePass.colorAttachments[i + 1].texture = impl->kbufferTextures[i];
+      resolvePass.colorAttachments[i + 1].loadAction = MTLLoadActionLoad;
+      resolvePass.colorAttachments[i + 1].storeAction = MTLStoreActionDontCare;
+    }
+
+    id<MTLRenderCommandEncoder> resolveEncoder = [cmdBuffer renderCommandEncoderWithDescriptor:resolvePass];
+    [resolveEncoder setLabel:@"K-Buffer Resolve Pass"];
+    [resolveEncoder setRenderPipelineState:impl->resolvePipelineState];
+
+    [resolveEncoder drawPrimitives:MTLPrimitiveTypeTriangle
+                        vertexStart:0
+                        vertexCount:3];
+    [resolveEncoder endEncoding];
+  }
 }
