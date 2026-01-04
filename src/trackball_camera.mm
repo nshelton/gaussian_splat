@@ -5,7 +5,7 @@
 TrackballCamera::TrackballCamera()
     : position(simd_make_float3(0, 0, 5))
     , target(simd_make_float3(0, 0, 0))
-    , up(simd_make_float3(0, 1, 0))
+    , up(simd_make_float3(0, -1, 0))
     , distance(5.0f)
     , viewportWidth(800)
     , viewportHeight(600)
@@ -54,7 +54,7 @@ void TrackballCamera::handleMouseUp() {
 
 void TrackballCamera::handleMouseMove(float x, float y) {
     simd_float2 currentPos = simd_make_float2(x, y);
-    simd_float2 delta = currentPos - lastMousePos;
+    simd_float2 delta = lastMousePos - currentPos;
 
     if (isRotating) {
         // Trackball rotation: horizontal drag rotates around world Y, vertical drag rotates around camera right
@@ -87,8 +87,8 @@ void TrackballCamera::handleMouseMove(float x, float y) {
         simd_float3 right = simd_normalize(simd_cross(target - position, up));
         simd_float3 upVec = simd_normalize(simd_cross(right, target - position));
 
-        float panX = -delta.x * panSpeed * distance / viewportHeight;
-        float panY = delta.y * panSpeed * distance / viewportHeight;
+        float panX = delta.x * panSpeed * distance / viewportHeight;
+        float panY = -delta.y * panSpeed * distance / viewportHeight;
 
         simd_float3 offset = right * panX + upVec * panY;
         position += offset;

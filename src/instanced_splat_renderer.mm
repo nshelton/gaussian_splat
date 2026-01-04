@@ -31,13 +31,24 @@ public:
 
     // Load shader from file (store path for hot reload)
     if (!shaderPath) {
-      shaderPath = [[NSBundle mainBundle] pathForResource:@"gaussian_splat" ofType:@"metal" inDirectory:@"shaders"];
+      // For development: watch the SOURCE file, not the build directory copy
+      // This way edits to the source file trigger hot-reload immediately
+      NSString *executablePath = [[NSBundle mainBundle] executablePath];
+      NSString *buildDir = [executablePath stringByDeletingLastPathComponent];
 
-      // If not in bundle, try relative to executable (for development builds)
-      if (!shaderPath) {
-        NSString *executablePath = [[NSBundle mainBundle] executablePath];
-        NSString *buildDir = [executablePath stringByDeletingLastPathComponent];
-        shaderPath = [buildDir stringByAppendingPathComponent:@"../shaders/gaussian_splat.metal"];
+      // Go up from build/gaussian_splat.app/Contents/MacOS to the source directory
+      shaderPath = [buildDir stringByAppendingPathComponent:@"../../../../shaders/gaussian_splat.metal"];
+      shaderPath = [shaderPath stringByStandardizingPath];
+
+      // Verify the source file exists
+      if (![[NSFileManager defaultManager] fileExistsAtPath:shaderPath]) {
+        std::cerr << "⚠️  Source shader not found at: " << [shaderPath UTF8String] << std::endl;
+
+        // Fallback to build directory copy
+        shaderPath = [[NSBundle mainBundle] pathForResource:@"gaussian_splat" ofType:@"metal" inDirectory:@"shaders"];
+        if (!shaderPath) {
+          shaderPath = [buildDir stringByAppendingPathComponent:@"../shaders/gaussian_splat.metal"];
+        }
       }
     }
 
@@ -97,21 +108,18 @@ public:
     pipelineDesc.fragmentFunction = fragmentFunc;
 
     // Single color attachment
-    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    pipelineDesc.colorAttachments[0].blendingEnabled = NO;  // Opaque rendering
+    // pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // pipelineDesc.colorAttachments[0].blendingEnabled = NO;  // Opaque rendering
 
     // Single color attachment with standard alpha blending
-    // pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    // pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    // pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    // pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    // pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    // pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    // pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    // pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-
-    // Enable depth testing for opaque quads
-    pipelineDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pipelineDesc.colorAttachments[0].blendingEnabled = YES;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+    pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
 
     pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
 
@@ -135,10 +143,10 @@ public:
     uniformBuffer = [device newBufferWithLength:sizeof(UniformData) options:MTLResourceStorageModeShared];
 
     // Create depth stencil state for opaque rendering
-    MTLDepthStencilDescriptor *depthDesc = [[MTLDepthStencilDescriptor alloc] init];
-    depthDesc.depthCompareFunction = MTLCompareFunctionGreater;  // Try Greater if Less appears backwards
-    depthDesc.depthWriteEnabled = YES;
-    depthStencilState = [device newDepthStencilStateWithDescriptor:depthDesc];
+    // MTLDepthStencilDescriptor *depthDesc = [[MTLDepthStencilDescriptor alloc] init];
+    // depthDesc.depthCompareFunction = MTLCompareFunctionGreater;  // Try Greater if Less appears backwards
+    // depthDesc.depthWriteEnabled = YES;
+    // depthStencilState = [device newDepthStencilStateWithDescriptor:depthDesc];
 
     return true;
   }
@@ -185,9 +193,16 @@ public:
     if (attributes) {
       NSTimeInterval modTime = [[attributes fileModificationDate] timeIntervalSinceReferenceDate];
       if (modTime > lastModifiedTime) {
+        std::cout << "\n🔄 Shader file modified: " << [shaderPath UTF8String] << std::endl;
+        std::cout << "   Old time: " << lastModifiedTime << ", New time: " << modTime << std::endl;
         lastModifiedTime = modTime;
         shaderNeedsReload = true;
-        std::cout << "\n🔄 Shader file modified, will reload on next frame..." << std::endl;
+      }
+    } else if (error) {
+      static bool errorPrinted = false;
+      if (!errorPrinted) {
+        std::cerr << "⚠️  Error checking shader file: " << [[error localizedDescription] UTF8String] << std::endl;
+        errorPrinted = true;
       }
     }
   }
@@ -255,9 +270,12 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
     inst.rotation[2] = point.rot_2;
     inst.rotation[3] = point.rot_3;
 
-    // normalize quaternion herespo
+    // clip to [-r, r]
+    float r = 5;
+    if ( abs(point.x) < r && abs(point.y)<  r && abs(point.z) < r ) {
+        _instances.push_back(inst);
+    }  
 
-    _instances.push_back(inst);
   }
 
   impl->instanceCount = _instances.size();
@@ -277,7 +295,7 @@ bool InstancedSplatRenderer::initialize(void *device) {
   }
 
   // Enable shader hot-reload for development
-  impl->initializeFileWatcher();
+  impl->initializeFileWatcher();    
 
   // Now that we have a device, create the instance buffer
   if (!_instances.empty()) {
@@ -352,7 +370,7 @@ void InstancedSplatRenderer::render(void *commandBuffer,
   id<MTLRenderCommandEncoder> encoder = [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
   [encoder setLabel:@"Gaussian Splat Pass"];
   [encoder setRenderPipelineState:impl->pipelineState];
-  [encoder setDepthStencilState:impl->depthStencilState];
+  // [encoder setDepthStencilState:impl->depthStencilState];
   [encoder setCullMode:MTLCullModeNone];  // Render both sides of billboards
 
   // Bind buffers
