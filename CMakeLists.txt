@@ -21,6 +21,7 @@ include_directories(${SDL2_INCLUDE_DIRS})
 find_library(METAL_LIBRARY Metal)
 find_library(QUARTZCORE_LIBRARY QuartzCore)
 find_library(FOUNDATION_LIBRARY Foundation)
+find_library(CORESERVICES_LIBRARY CoreServices)
 
 # ImGui sources
 set(IMGUI_DIR ${imgui_SOURCE_DIR})
@@ -64,6 +65,8 @@ target_link_libraries(gaussian_splat
     ${METAL_LIBRARY}
     ${QUARTZCORE_LIBRARY}
     ${FOUNDATION_LIBRARY}
+    ${CORESERVICES_LIBRARY}  
+
 )
 
 # Copy shaders to build directory for development

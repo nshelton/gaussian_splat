@@ -57,22 +57,21 @@ void TrackballCamera::handleMouseMove(float x, float y) {
     simd_float2 delta = currentPos - lastMousePos;
 
     if (isRotating) {
-        // Simple rotation based on mouse delta in camera space
+        // Trackball rotation: horizontal drag rotates around world Y, vertical drag rotates around camera right
         float deltaX = delta.x * rotateSpeed * 0.01f;
         float deltaY = delta.y * rotateSpeed * 0.01f;
 
-        // Get camera right and up vectors
+        // Get camera right vector (perpendicular to view direction and world up)
         simd_float3 viewDir = simd_normalize(target - position);
-        simd_float3 right = simd_normalize(simd_cross(viewDir, up));
-        simd_float3 cameraUp = simd_normalize(simd_cross(right, viewDir));
+        simd_float3 right = simd_normalize(simd_cross(viewDir, simd_make_float3(0, 1, 0)));
 
         // Rotate around camera's right axis (vertical mouse movement)
         simd_quatf rotX = simd_quaternion(-deltaY, right);
 
-        // Rotate around camera's up axis (horizontal mouse movement)
-        simd_quatf rotY = simd_quaternion(-deltaX, cameraUp);
+        // Rotate around WORLD up axis (horizontal mouse movement)
+        simd_quatf rotY = simd_quaternion(-deltaX, simd_make_float3(0, 1, 0));
 
-        // Combine rotations
+        // Combine rotations: apply horizontal rotation first (world space), then vertical (camera space)
         simd_quatf rotation = simd_mul(rotY, rotX);
 
         // Rotate the camera position around the target
@@ -80,7 +79,7 @@ void TrackballCamera::handleMouseMove(float x, float y) {
         offset = simd_act(rotation, offset);
         position = target + offset;
 
-        // Rotate the up vector
+        // Update the up vector to maintain camera orientation
         up = simd_act(rotation, up);
         up = simd_normalize(up);
     } else if (isPanning) {

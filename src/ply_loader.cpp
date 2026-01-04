@@ -105,7 +105,7 @@ bool PLYLoader::load(const std::string& filepath, std::vector<PointData>& points
 
                     switch(idx) {
                         case 0: pt.x = value; break;
-                        case 1: pt.y = -value; break; // flip y axis here
+                        case 1: pt.y = value; break;
                         case 2: pt.z = value; break;
                         case 3: pt.nx = value; break;
                         case 4: pt.ny = value; break;

@@ -4,8 +4,8 @@
 #include <vector>
 
 struct SplatInstance {
-    float rotation[4];  // 12 bytes, no padding
-    float scale[3];  // 12 bytes, no padding
+    float rotation[4];  // 16 bytes wxyz
+    float scale[3];     // 12 bytes, no padding
     float position[3];  // 12 bytes, no padding
     float color[4];     // 16 bytes
 };

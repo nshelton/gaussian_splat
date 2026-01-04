@@ -10,7 +10,7 @@ struct PointData {
     float r, g, b;           // Color (from f_dc_0, f_dc_1, f_dc_2 or direct RGB)
     float opacity;           // Opacity/alpha
     float scale_x, scale_y, scale_z;     // Scale (scale_0, scale_1, scale_2)
-    float rot_0, rot_1, rot_2, rot_3;    // Rotation quaternion
+    float rot_0, rot_1, rot_2, rot_3;    // Rotation quaternion (w, x, y, z)
 
     // Spherical harmonics coefficients (45 f_rest values)
     float sh_rest[45];
