@@ -54,7 +54,7 @@ int main(int argc, char *argv[]) {
   // Initialize camera
   TrackballCamera camera;
   camera.setViewportSize(drawableWidth, drawableHeight);
-  camera.setPosition(simd_make_float3(0, 2, 5));
+  camera.setPosition(simd_make_float3(0, -2, 5));
   camera.setTarget(simd_make_float3(0, 0, 0));
 
   // Create scene objects
@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
 
   // Load Gaussian splat from PLY file
   std::string plyPath = "/Users/nshelton/cpp_practice/gaussian_splat/models/"
-                        "truck/point_cloud/iteration_30000/point_cloud.ply";
+                        "bicycle/point_cloud/iteration_30000/point_cloud.ply";
   InstancedSplatRenderer splatRenderer(plyPath);
   splatRenderer.initialize(renderer.getDevice());
 

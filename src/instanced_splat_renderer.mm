@@ -248,8 +248,13 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
     inst.rotation[2] = point.rot_2;
     inst.rotation[3] = point.rot_3;
 
+    // Copy spherical harmonics coefficients
+    for (int i = 0; i < 45; i++) {
+      inst.sh_rest[i] = point.sh_rest[i];
+    }
+
     // clip to [-r, r]
-    float r = 5;
+    float r = 2;
     float area = inst.scale[0] * inst.scale[1] * inst.scale[2];
     
     if (area < 0.1 && abs(point.x) < r && abs(point.y) < r && abs(point.z) < r) {

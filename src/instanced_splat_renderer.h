@@ -7,7 +7,8 @@ struct SplatInstance {
     float rotation[4];  // 16 bytes wxyz
     float scale[3];     // 12 bytes, no padding
     float position[3];  // 12 bytes, no padding
-    float color[4];     // 16 bytes
+    float color[4];     // 16 bytes RGBA (DC coefficients + opacity)
+    float sh_rest[45];  // 180 bytes - remaining SH coefficients (degree 1-3)
 };
 
 class InstancedSplatRenderer {
