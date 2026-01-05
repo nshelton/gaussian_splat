@@ -27,6 +27,9 @@ public:
 
     int getPointCount() const { return _instances.size(); }
 
+    // Performance metrics
+    double getCpuSortTimeMs() const;
+
 private:
     std::vector<SplatInstance> _instances;
     class Impl;

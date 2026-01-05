@@ -154,7 +154,7 @@ int main(int argc, char *argv[]) {
     renderer.beginFrame();
 
     // Update timing history
-    cpuTimeHistory[historyOffset] = avgFrameTime;
+    cpuTimeHistory[historyOffset] = splatRenderer.getCpuSortTimeMs();
     gpuTimeHistory[historyOffset] = renderer.getLastGpuTime();
     historyOffset = (historyOffset + 1) % historySize;
 
@@ -166,7 +166,7 @@ int main(int argc, char *argv[]) {
     ImGui::Separator();
 
     // CPU timing with plot
-    ImGui::Text("CPU: %.2f ms", avgFrameTime);
+    ImGui::Text("CPU: %.2f ms", splatRenderer.getCpuSortTimeMs());
     ImGui::PlotLines("##cpu", cpuTimeHistory, historySize, historyOffset,
                      nullptr, 0.0f, 20.0f, ImVec2(300, 60));
 

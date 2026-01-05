@@ -1,5 +1,4 @@
 #include <metal_stdlib>
-#include "gaussian_splat_types.h"
 using namespace metal;
 
 struct SplatInstance {
@@ -90,10 +89,14 @@ vertex VertexOut vertex_main(
     uint vertexID [[vertex_id]],
     uint instanceID [[instance_id]],
     constant SplatInstance* instances [[buffer(0)]],
-    constant Uniforms& uniforms [[buffer(1)]]
+    constant Uniforms& uniforms [[buffer(1)]],
+    constant uint* sortedIndices [[buffer(2)]]
 ) {
     VertexOut out;
-    const SplatInstance instance = instances[instanceID];
+
+    // Use sorted index for depth ordering (back-to-front)
+    uint actualIndex = sortedIndices[instanceID];
+    const SplatInstance instance = instances[actualIndex];
 
     // World -> view for the splat center
     const float4 viewPos4 = uniforms.viewMatrix * float4(instance.position, 1.0);
@@ -176,60 +179,28 @@ vertex VertexOut vertex_main(
 }
 
 
-fragment void fragment_main(
-    VertexOut in [[stage_in]],
-    imageblock_data<ImageBlockData> imageblock [[imageblock_data]]
-) {
+fragment float4 fragment_main(VertexOut in [[stage_in]]) 
+{
     // Evaluate 2D Gaussian
     // UV coordinates are in standard deviation units: [-3σ, 3σ] range
     float2 d = in.uv;
 
-    // Cull splats behind camera
-    if (in.depth < 0.001) {
+    // // Cull splats behind camera
+    if (in.depth < 0.5) {
         discard_fragment();
     }
 
     // Canonical Gaussian in sigma space: exp(-0.5 * ||d||^2)
     float gaussianValue = exp(-0.5 * dot(d, d));
 
-    // Discard fragments that contribute very little
-    if (gaussianValue < 0.01) {
-        discard_fragment();
-    }
-
     // Apply per-splat opacity
     float alpha = gaussianValue * in.color.a;
 
-    // Write to imageblock instead of framebuffer
-    uint index = imageblock.count;
-
-    if (index >= MAX_FRAGMENTS_PER_PIXEL) {
-        // OVERFLOW HANDLING: Replace furthest fragment if current is closer
-        uint furthest_idx = 0;
-        half furthest_depth = imageblock.fragments[0].depth;
-
-        for (uint i = 1; i < MAX_FRAGMENTS_PER_PIXEL; i++) {
-            if (imageblock.fragments[i].depth < furthest_depth) {
-                furthest_depth = imageblock.fragments[i].depth;
-                furthest_idx = i;
-            }
-        }
-
-        // Only replace if current fragment is closer
-        if (half(in.depth) > furthest_depth) {
-            index = furthest_idx;
-        } else {
-            discard_fragment();  // Current fragment is further, discard
-        }
+    // Discard fragments that contribute very little
+    if (gaussianValue < 0.1) {
+        discard_fragment();
     }
-
-    // Write fragment data
-    imageblock.fragments[index].depth = half(in.depth);
-    imageblock.fragments[index].color = half3(in.color.rgb);
-    imageblock.fragments[index].alpha = half(alpha);
-
-    if (index == imageblock.count) {
-        imageblock.count++;  // Increment only if new fragment
-    }
+    // Return color with gaussian-modulated alpha
+    return float4(in.color.rgb, alpha);
 }
 

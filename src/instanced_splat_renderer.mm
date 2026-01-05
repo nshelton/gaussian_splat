@@ -1,17 +1,19 @@
 #include "instanced_splat_renderer.h"
 #include "ply_loader.h"
+#import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#include <objc/objc.h>
+#include <chrono>
 #include <iostream>
+#include <objc/objc.h>
 #import <simd/simd.h>
 #include <vector>
-#import <Foundation/Foundation.h>
 
 class InstancedSplatRenderer::Impl {
 public:
   id<MTLDevice> device;
   id<MTLRenderPipelineState> pipelineState;
   id<MTLBuffer> instanceBuffer;
+  id<MTLBuffer> sortedIndexBuffer;  // Sorted indices for depth ordering
   id<MTLBuffer> uniformBuffer;
   id<MTLTexture> depthTexture;
   id<MTLDepthStencilState> depthStencilState;
@@ -26,6 +28,13 @@ public:
   int currentWidth = 0;
   int currentHeight = 0;
 
+  // Performance tracking
+  double lastSortTimeMs = 0.0;
+
+  // Persistent sort buffers (reused each frame to avoid allocations)
+  std::vector<std::pair<float, uint32_t>> depthIndexBuffer;
+  std::vector<uint32_t> sortedIndicesBuffer;
+
   bool initializePipeline() {
     NSError *error = nil;
 
@@ -36,29 +45,38 @@ public:
       NSString *executablePath = [[NSBundle mainBundle] executablePath];
       NSString *buildDir = [executablePath stringByDeletingLastPathComponent];
 
-      // Go up from build/gaussian_splat.app/Contents/MacOS to the source directory
-      shaderPath = [buildDir stringByAppendingPathComponent:@"../../../../shaders/gaussian_splat.metal"];
+      // Go up from build/gaussian_splat.app/Contents/MacOS to the source
+      // directory
+      shaderPath = [buildDir stringByAppendingPathComponent:
+                                 @"../../../../shaders/gaussian_splat.metal"];
       shaderPath = [shaderPath stringByStandardizingPath];
 
       // Verify the source file exists
       if (![[NSFileManager defaultManager] fileExistsAtPath:shaderPath]) {
-        std::cerr << "⚠️  Source shader not found at: " << [shaderPath UTF8String] << std::endl;
+        std::cerr << "⚠️  Source shader not found at: " <<
+            [shaderPath UTF8String] << std::endl;
 
         // Fallback to build directory copy
-        shaderPath = [[NSBundle mainBundle] pathForResource:@"gaussian_splat" ofType:@"metal" inDirectory:@"shaders"];
+        shaderPath = [[NSBundle mainBundle] pathForResource:@"gaussian_splat"
+                                                     ofType:@"metal"
+                                                inDirectory:@"shaders"];
         if (!shaderPath) {
-          shaderPath = [buildDir stringByAppendingPathComponent:@"../shaders/gaussian_splat.metal"];
+          shaderPath = [buildDir stringByAppendingPathComponent:
+                                     @"../shaders/gaussian_splat.metal"];
         }
       }
     }
 
-    NSString *shaderSource = [NSString stringWithContentsOfFile:shaderPath
-                                                       encoding:NSUTF8StringEncoding
-                                                          error:&error];
+    NSString *shaderSource =
+        [NSString stringWithContentsOfFile:shaderPath
+                                  encoding:NSUTF8StringEncoding
+                                     error:&error];
     if (!shaderSource) {
-      std::cerr << "❌ Failed to load shader file: " << [shaderPath UTF8String] << std::endl;
+      std::cerr << "❌ Failed to load shader file: " << [shaderPath UTF8String]
+                << std::endl;
       if (error) {
-        std::cerr << "   Error: " << [[error localizedDescription] UTF8String] << std::endl;
+        std::cerr << "   Error: " << [[error localizedDescription] UTF8String]
+                  << std::endl;
       }
       return false;
     }
@@ -69,70 +87,84 @@ public:
     // Enable shader debugging for Instruments profiling
     MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
     if (@available(macOS 15.0, *)) {
-        options.mathMode = MTLMathModeRelaxed;  // Better for debugging
+      options.mathMode = MTLMathModeRelaxed; // Better for debugging
     } else {
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        options.fastMathEnabled = NO;
-        #pragma clang diagnostic pop
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      options.fastMathEnabled = NO;
+#pragma clang diagnostic pop
     }
 
     id<MTLLibrary> library = [device newLibraryWithSource:shaderSource
                                                   options:options
-                                                  error:&error];
+                                                    error:&error];
     if (!library) {
       std::cerr << "❌ Shader compilation failed!" << std::endl;
-      std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
+      std::cerr << "   " << [[error localizedDescription] UTF8String]
+                << std::endl;
 
       // Print detailed compilation errors if available
       if (error.userInfo) {
-        NSString *compilerOutput = error.userInfo[@"MTLLibraryErrorCompilerOutput"];
+        NSString *compilerOutput =
+            error.userInfo[@"MTLLibraryErrorCompilerOutput"];
         if (compilerOutput) {
-          std::cerr << "\n📝 Compiler output:\n" << [compilerOutput UTF8String] << std::endl;
+          std::cerr << "\n📝 Compiler output:\n"
+                    << [compilerOutput UTF8String] << std::endl;
         }
       }
       return false;
     }
 
     id<MTLFunction> vertexFunc = [library newFunctionWithName:@"vertex_main"];
-    id<MTLFunction> fragmentFunc = [library newFunctionWithName:@"fragment_main"];
+    id<MTLFunction> fragmentFunc =
+        [library newFunctionWithName:@"fragment_main"];
 
     if (!vertexFunc || !fragmentFunc) {
-      std::cerr << "❌ Failed to find shader functions (vertex_main, fragment_main)" << std::endl;
+      std::cerr
+          << "❌ Failed to find shader functions (vertex_main, fragment_main)"
+          << std::endl;
       return false;
     }
 
     // Create simple pipeline with alpha blending
-    MTLRenderPipelineDescriptor *pipelineDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    MTLRenderPipelineDescriptor *pipelineDesc =
+        [[MTLRenderPipelineDescriptor alloc] init];
     pipelineDesc.vertexFunction = vertexFunc;
     pipelineDesc.fragmentFunction = fragmentFunc;
 
     // Single color attachment
     // pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    // pipelineDesc.colorAttachments[0].blendingEnabled = NO;  // Opaque rendering
+    // pipelineDesc.colorAttachments[0].blendingEnabled = NO;  // Opaque
+    // rendering
 
     // Single color attachment with standard alpha blending
     pipelineDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pipelineDesc.colorAttachments[0].blendingEnabled = YES;
-    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].sourceRGBBlendFactor =
+        MTLBlendFactorSourceAlpha;
+    pipelineDesc.colorAttachments[0].destinationRGBBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
     pipelineDesc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    pipelineDesc.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
     pipelineDesc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
 
-    pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc error:&error];
+    pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDesc
+                                                           error:&error];
 
     if (!pipelineState) {
       std::cerr << "❌ Failed to create splat pipeline state!" << std::endl;
-      std::cerr << "   " << [[error localizedDescription] UTF8String] << std::endl;
+      std::cerr << "   " << [[error localizedDescription] UTF8String]
+                << std::endl;
       return false;
     }
 
     std::cout << "✅ Shader pipeline compiled successfully\n" << std::endl;
 
-    // Create uniform buffer - use the actual struct definition to ensure correct size
-    // Metal has strict alignment rules, so we define the struct to match the shader
+    // Create uniform buffer - use the actual struct definition to ensure
+    // correct size Metal has strict alignment rules, so we define the struct to
+    // match the shader
     struct UniformData {
       simd_float4x4 viewProjectionMatrix;
       simd_float4x4 viewMatrix;
@@ -140,20 +172,22 @@ public:
       simd_float2 viewportSize;
     };
 
-    uniformBuffer = [device newBufferWithLength:sizeof(UniformData) options:MTLResourceStorageModeShared];
+    uniformBuffer = [device newBufferWithLength:sizeof(UniformData)
+                                        options:MTLResourceStorageModeShared];
 
     // Create depth stencil state for opaque rendering
-    // MTLDepthStencilDescriptor *depthDesc = [[MTLDepthStencilDescriptor alloc] init];
-    // depthDesc.depthCompareFunction = MTLCompareFunctionGreater;  // Try Greater if Less appears backwards
-    // depthDesc.depthWriteEnabled = YES;
-    // depthStencilState = [device newDepthStencilStateWithDescriptor:depthDesc];
+    // MTLDepthStencilDescriptor *depthDesc = [[MTLDepthStencilDescriptor alloc]
+    // init]; depthDesc.depthCompareFunction = MTLCompareFunctionGreater;  //
+    // Try Greater if Less appears backwards depthDesc.depthWriteEnabled = YES;
+    // depthStencilState = [device
+    // newDepthStencilStateWithDescriptor:depthDesc];
 
     return true;
   }
 
   void ensureDepthTexture(int width, int height) {
     if (depthTexture && currentWidth == width && currentHeight == height) {
-      return;  // Texture already exists with correct size
+      return; // Texture already exists with correct size
     }
 
     currentWidth = width;
@@ -170,60 +204,6 @@ public:
 
     depthTexture = [device newTextureWithDescriptor:depthDesc];
     [depthTexture setLabel:@"Splat Depth Buffer"];
-  }
-
-
-  void initializeFileWatcher() {
-    if (!shaderPath) return;
-
-    // Get initial modification time
-    NSError *error = nil;
-    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:shaderPath error:&error];
-    if (attributes) {
-      lastModifiedTime = [[attributes fileModificationDate] timeIntervalSinceReferenceDate];
-      std::cout << "Shader hot-reload enabled - watching: " << [shaderPath UTF8String] << std::endl;
-    }
-  }
-
-  void checkForShaderChanges() {
-    if (!shaderPath) return;
-
-    NSError *error = nil;
-    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:shaderPath error:&error];
-    if (attributes) {
-      NSTimeInterval modTime = [[attributes fileModificationDate] timeIntervalSinceReferenceDate];
-      if (modTime > lastModifiedTime) {
-        std::cout << "\n🔄 Shader file modified: " << [shaderPath UTF8String] << std::endl;
-        std::cout << "   Old time: " << lastModifiedTime << ", New time: " << modTime << std::endl;
-        lastModifiedTime = modTime;
-        shaderNeedsReload = true;
-      }
-    } else if (error) {
-      static bool errorPrinted = false;
-      if (!errorPrinted) {
-        std::cerr << "⚠️  Error checking shader file: " << [[error localizedDescription] UTF8String] << std::endl;
-        errorPrinted = true;
-      }
-    }
-  }
-
-  bool checkAndReloadShader() {
-    if (!shaderNeedsReload) return true;
-
-    shaderNeedsReload = false;
-
-    // Save old pipeline state in case reload fails
-    id<MTLRenderPipelineState> oldPipeline = pipelineState;
-
-    if (initializePipeline()) {
-      std::cout << "✅ Shader hot-reload successful!\n" << std::endl;
-      return true;
-    } else {
-      std::cerr << "⚠️  Shader reload failed - keeping previous working version\n" << std::endl;
-      // Restore old pipeline state
-      pipelineState = oldPipeline;
-      return false;
-    }
   }
 };
 
@@ -250,11 +230,10 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
   _instances.reserve(points.size());
   for (const auto &point : points) {
     SplatInstance inst;
-    // flip y 
     inst.position[0] = point.x;
     inst.position[1] = point.y;
     inst.position[2] = point.z;
-  
+
     inst.color[0] = point.r;
     inst.color[1] = point.g;
     inst.color[2] = point.b;
@@ -264,7 +243,6 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
     inst.scale[1] = point.scale_y;
     inst.scale[2] = point.scale_z;
 
-    // flip quaternion to match the y flip
     inst.rotation[0] = point.rot_0;
     inst.rotation[1] = point.rot_1;
     inst.rotation[2] = point.rot_2;
@@ -272,10 +250,11 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
 
     // clip to [-r, r]
     float r = 5;
-    if ( abs(point.x) < r && abs(point.y)<  r && abs(point.z) < r ) {
-        _instances.push_back(inst);
-    }  
-
+    float area = inst.scale[0] * inst.scale[1] * inst.scale[2];
+    
+    if (area < 0.1 && abs(point.x) < r && abs(point.y) < r && abs(point.z) < r) {
+      _instances.push_back(inst);
+    }
   }
 
   impl->instanceCount = _instances.size();
@@ -283,8 +262,10 @@ InstancedSplatRenderer::InstancedSplatRenderer(std::string plyPath)
             << " instances" << std::endl;
 }
 
-InstancedSplatRenderer::~InstancedSplatRenderer() {
-  delete impl;
+InstancedSplatRenderer::~InstancedSplatRenderer() { delete impl; }
+
+double InstancedSplatRenderer::getCpuSortTimeMs() const {
+  return impl->lastSortTimeMs;
 }
 
 bool InstancedSplatRenderer::initialize(void *device) {
@@ -293,9 +274,6 @@ bool InstancedSplatRenderer::initialize(void *device) {
   if (!impl->initializePipeline()) {
     return false;
   }
-
-  // Enable shader hot-reload for development
-  impl->initializeFileWatcher();    
 
   // Now that we have a device, create the instance buffer
   if (!_instances.empty()) {
@@ -312,22 +290,17 @@ bool InstancedSplatRenderer::initialize(void *device) {
   return true;
 }
 
-void InstancedSplatRenderer::render(void *commandBuffer,
-                                    void *drawableTexture,
+void InstancedSplatRenderer::render(void *commandBuffer, void *drawableTexture,
                                     const simd_float4x4 &viewMatrix,
                                     const simd_float4x4 &projectionMatrix,
-                                    float viewportWidth,
-                                    float viewportHeight) {
-  // Check for shader file changes and hot-reload if needed
-  impl->checkForShaderChanges();
-  impl->checkAndReloadShader();
+                                    float viewportWidth, float viewportHeight) {
 
   if (impl->instanceCount == 0) {
     return;
   }
 
   if (!commandBuffer || !drawableTexture) {
-    return;  // No valid frame resources
+    return; // No valid frame resources
   }
 
   id<MTLCommandBuffer> cmdBuffer = (__bridge id<MTLCommandBuffer>)commandBuffer;
@@ -355,33 +328,81 @@ void InstancedSplatRenderer::render(void *commandBuffer,
 
   memcpy([impl->uniformBuffer contents], &uniforms, sizeof(UniformData));
 
+  // ========== CPU DEPTH SORTING (OPTIMIZED) ==========
+  auto sortStartTime = std::chrono::high_resolution_clock::now();
+
+  // Reuse persistent buffers (avoid per-frame allocations)
+  size_t count = _instances.size();
+  impl->depthIndexBuffer.resize(count);
+  impl->sortedIndicesBuffer.resize(count);
+
+  // OPTIMIZATION 1: Parallel depth computation using Grand Central Dispatch
+  const SplatInstance* instancesPtr = _instances.data();
+  auto* depthIndexPtr = impl->depthIndexBuffer.data();
+
+  dispatch_apply(count, DISPATCH_APPLY_AUTO, ^(size_t i) {
+    const SplatInstance& splat = instancesPtr[i];
+
+    // Transform to view space (using SIMD for efficiency)
+    simd_float4 posHomogeneous = simd_make_float4(splat.position[0], splat.position[1], splat.position[2], 1.0f);
+    simd_float4 viewPos = simd_mul(viewMatrix, posHomogeneous);
+    float depth = -viewPos.z;  // Negative Z is forward in view space
+
+    depthIndexPtr[i] = {depth, (uint32_t)i};
+  });
+
+  // OPTIMIZATION 2: Use std::sort (could use pdqsort or radix sort for even better perf)
+  std::sort(impl->depthIndexBuffer.begin(), impl->depthIndexBuffer.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+  // Extract sorted indices
+  for (size_t i = 0; i < count; i++) {
+    impl->sortedIndicesBuffer[i] = impl->depthIndexBuffer[i].second;
+  }
+
+  // Upload sorted indices to GPU
+  if (!impl->sortedIndexBuffer || impl->sortedIndexBuffer.length < count * sizeof(uint32_t)) {
+    impl->sortedIndexBuffer = [impl->device newBufferWithLength:count * sizeof(uint32_t)
+                                                        options:MTLResourceStorageModeShared];
+  }
+  memcpy([impl->sortedIndexBuffer contents], impl->sortedIndicesBuffer.data(), count * sizeof(uint32_t));
+
+  auto sortEndTime = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double, std::milli> sortDuration = sortEndTime - sortStartTime;
+  impl->lastSortTimeMs = sortDuration.count();
+
   // Render splats directly to drawable with depth testing
-  MTLRenderPassDescriptor *passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+  MTLRenderPassDescriptor *passDesc =
+      [MTLRenderPassDescriptor renderPassDescriptor];
   passDesc.colorAttachments[0].texture = drawable;
-  passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;  // Preserve existing content
+  passDesc.colorAttachments[0].loadAction =
+      MTLLoadActionLoad; // Preserve existing content
   passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
 
   // Configure depth attachment for opaque rendering
   passDesc.depthAttachment.texture = impl->depthTexture;
   passDesc.depthAttachment.loadAction = MTLLoadActionClear;
   passDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
-  passDesc.depthAttachment.clearDepth = 0.0;  // Clear to 0.0 for Greater comparison
+  passDesc.depthAttachment.clearDepth =
+      0.0; // Clear to 0.0 for Greater comparison
 
-  id<MTLRenderCommandEncoder> encoder = [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
+  id<MTLRenderCommandEncoder> encoder =
+      [cmdBuffer renderCommandEncoderWithDescriptor:passDesc];
   [encoder setLabel:@"Gaussian Splat Pass"];
   [encoder setRenderPipelineState:impl->pipelineState];
   // [encoder setDepthStencilState:impl->depthStencilState];
-  [encoder setCullMode:MTLCullModeNone];  // Render both sides of billboards
+  [encoder setCullMode:MTLCullModeNone]; // Render both sides of billboards
 
   // Bind buffers
   [encoder setVertexBuffer:impl->instanceBuffer offset:0 atIndex:0];
   [encoder setVertexBuffer:impl->uniformBuffer offset:0 atIndex:1];
+  [encoder setVertexBuffer:impl->sortedIndexBuffer offset:0 atIndex:2];  // Sorted indices
 
   // Draw instanced quads
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle
-                vertexStart:0
-                vertexCount:6
-              instanceCount:impl->instanceCount];
+              vertexStart:0
+              vertexCount:6
+            instanceCount:impl->instanceCount];
 
   [encoder endEncoding];
 }
